@@ -1,199 +1,222 @@
 import streamlit as st
-import openai
-from llama_index.llms.openai import OpenAI
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
-from llama_index.core.node_parser import SimpleNodeParser
-import re
+import fitz  # PyMuPDF
+from openai import OpenAI
+import io
+import base64
+from PIL import Image
+import time
 import os
+import json
+from pathlib import Path
 
-# Set up the Streamlit page configuration
+# Set page configuration
 st.set_page_config(
-    page_title="Rag Based Newspaper Search for CMO",
-    page_icon="🦙",
-    layout="centered",
-    initial_sidebar_state="auto"
+    page_title="ગુજરાતી સમાચાર શોધક",
+    page_icon="📰",
+    layout="wide",
 )
 
-# Initialize OpenAI API key
-openai.api_key = st.secrets.get("openai_key", None)
-if not openai.api_key:
-    st.error("OpenAI API key is missing. Please add it to the Streamlit secrets.")
-    st.stop()
+# Initialize OpenAI client
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-st.title("NEWS FINDER")
+# Initialize session state
+if 'indexed_files' not in st.session_state:
+    st.session_state.indexed_files = {}
+if 'processed_cache' not in st.session_state:
+    st.session_state.processed_cache = {}
 
-# Initialize session state for messages and references
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": "Welcome! Please give me the tag you want me to look for in the newspapers."
-        }
-    ]
+# Constants
+DATA_DIR = Path("data")
+CACHE_FILE = DATA_DIR / "processed_cache.json"
 
-if "references" not in st.session_state:
-    st.session_state.references = []
+def load_cache():
+    """Load processed results from cache file"""
+    if CACHE_FILE.exists():
+        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
 
-@st.cache_resource(show_spinner=False)
-def load_data():
+def save_cache():
+    """Save processed results to cache file"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(st.session_state.processed_cache, f, ensure_ascii=False, indent=2)
+
+def encode_image_to_base64(image):
+    """Convert PIL Image to base64 string"""
+    buffered = io.BytesIO()
+    image.save(buffered, format="JPEG")
+    return base64.b64encode(buffered.getvalue()).decode()
+
+def convert_pdf_page_to_image(page):
+    """Convert a PDF page to PIL Image"""
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+    img_data = pix.tobytes("jpeg")
+    return Image.open(io.BytesIO(img_data))
+
+def process_image_with_gpt4_vision(image, tag):
+    """Process image using GPT-4 Vision API"""
     try:
-        node_parser = SimpleNodeParser.from_defaults(
-            chunk_size=2048,  # Increase chunk size to ensure more content is read
-            chunk_overlap=100,  # Adjust overlap to ensure continuity
+        base64_image = encode_image_to_base64(image)
+
+        response = client.chat.completions.create(
+            model="gpt-4-vision-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are a Gujarati newspaper expert. Analyze the image, find all relevant news related to the given tag, 
+                    and provide the following for each news item:
+                    1. The original Gujarati text
+                    2. English translation
+                    3. Detailed summary
+                    Format as:
+                    [Original Gujarati Text]
+                    [English Translation]
+                    [Brief Summary]
+                    ---"""
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Find all news related to '{tag}' in this newspaper image. Extract and translate the relevant text."},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4096
         )
-
-        reader = SimpleDirectoryReader(
-            input_dir="./data",
-            recursive=True,
-            filename_as_id=True
-        )
-        docs = reader.load_data()
-
-        system_prompt = """You are a Gujarati newspaper expert. Analyze the image, find all relevant news related to the given tag, 
-                        and provide the following for each news item:
-                        1. The original Gujarati text
-                        2. English translation
-                        3. Brief summary
-                        Format as:
-                        [Original Gujarati Text]
-                        [English Translation]
-                        [Detailed Summary]
-                        ---
-
-        For every fact or statement, include a reference to the source document and page number in this format:
-        [Source: Document_Name, Page X]
-
-        Always structure your responses in a clear, organized manner using:
-        - Bullet points for lists
-        - Numbered steps for procedures
-        - Bold text for important points
-        - Separate sections with clear headings"""
-
-        Settings.llm = OpenAI(
-            model="gpt-4",
-            temperature=0.1,
-            system_prompt=system_prompt,
-        )
-
-        index = VectorStoreIndex.from_documents(
-            docs,
-            node_parser=node_parser,
-            show_progress=True
-        )
-        return index
+        return response.choices[0].message.content
     except Exception as e:
-        st.error(f"Error loading data: {e}")
-        st.stop()
+        st.error(f"Error in GPT-4 Vision processing: {str(e)}")
+        return None
 
-def extract_references(text):
-    pattern = r'$Source: ([^,]+), Page (\d+)$'
-    matches = re.finditer(pattern, text)
-    references = []
+def index_pdf_files():
+    """Index all PDF files in the data directory at startup"""
+    if not DATA_DIR.exists():
+        os.makedirs(DATA_DIR)
+        return
 
-    for match in matches:
-        doc_name, page = match.groups()
-        link = f'<a href="data/{doc_name}.pdf#page={page}" target="_blank">[Source: {doc_name}, Page {page}]</a>'
-        text = text.replace(match.group(0), link)
-        references.append((doc_name, page))
+    pdf_files = list(DATA_DIR.glob("*.pdf"))
+    with st.spinner("Indexing PDF files..."):
+        for pdf_path in pdf_files:
+            if pdf_path.name not in st.session_state.indexed_files:
+                st.session_state.indexed_files[pdf_path.name] = str(pdf_path)
 
-    # Update session state with current references
-    st.session_state.references = list(set(references))  # Use set to avoid duplicate entries
-    return text
-
-def format_response(response):
-    formatted_response = extract_references(response)
-    formatted_response = formatted_response.replace("Step ", "\n### Step ")
-    formatted_response = formatted_response.replace("Note:", "\n> **Note:**")
-    formatted_response = formatted_response.replace("Important:", "\n> **Important:**")
-    return formatted_response
-
-def list_reference_documents():
+def process_pdf(pdf_path, tag, progress_bar):
+    """Process PDF using PyMuPDF and GPT-4 Vision"""
     try:
-        files = os.listdir('./data')
-        pdf_files = [f for f in files if f.endswith('.pdf')]
-        if pdf_files:
-            for pdf in pdf_files:
-                doc_name = os.path.splitext(pdf)[0]
-                st.markdown(f'- [{doc_name}](./data/{pdf})', unsafe_allow_html=True)
-        else:
-            st.write("No reference documents found.")
+        # Check if results are already cached
+        cache_key = f"{pdf_path}_{tag}"
+        if cache_key in st.session_state.processed_cache:
+            return st.session_state.processed_cache[cache_key]
+
+        doc = fitz.open(pdf_path)
+        all_results = []
+        total_pages = len(doc)
+
+        for i, page in enumerate(doc):
+            progress_bar.progress((i + 1) / total_pages,
+                              f"Processing page {i + 1} of {total_pages}")
+
+            image = convert_pdf_page_to_image(page)
+
+            if i == 0:
+                st.image(image, caption=f"Processing Page {i+1}", use_column_width=True)
+
+            result = process_image_with_gpt4_vision(image, tag)
+            if result:
+                all_results.append(result)
+
+            time.sleep(1)
+
+        doc.close()
+
+        # Cache the results
+        final_result = "\n".join(all_results)
+        st.session_state.processed_cache[cache_key] = final_result
+        save_cache()
+
+        return final_result
+
     except Exception as e:
-        st.error(f"Error listing documents: {e}")
+        st.error(f"Error in PDF processing: {str(e)}")
+        return None
 
-# Load the index
-index = load_data()
+def main():
+    # Load cache at startup
+    st.session_state.processed_cache = load_cache()
 
-# Sidebar for reference documents
-with st.sidebar:
-    st.header("📚 Reference Documents")
-    st.write("Available reference documents:")
-    list_reference_documents()
+    # Index PDF files at startup
+    index_pdf_files()
 
-    st.header("🔗 References Used")
-    if st.session_state.references:
-        for doc_name, page in st.session_state.references:
-            st.markdown(f'- [Source: {doc_name}, Page {page}](./data/{doc_name}.pdf#page={page})', unsafe_allow_html=True)
-    else:
-        st.write("No references used yet.")
+    st.title("ગુજરાતી સમાચાર શોધક (Gujarati News Finder)")
+    st.write("Search through indexed Gujarati newspapers")
 
-# User input for tag search
-tag = st.text_input("Enter a tag to search for in the headlines:")
+    # Display indexed files
+    st.sidebar.header("Indexed Files")
+    selected_files = st.sidebar.multiselect(
+        "Select files to search",
+        options=list(st.session_state.indexed_files.keys())
+    )
 
-# Search and display results
-if tag:
-    with st.spinner("Searching for news articles..."):
+    # Tag input
+    search_tag = st.text_input(
+        "Enter search tag",
+        placeholder="Enter topic in English or Gujarati",
+        help="Enter the topic you want to search for in the newspapers"
+    )
+
+    # Process button
+    if st.button("Search Newspapers 📰", key="process_btn"):
+        if not selected_files:
+            st.error("Please select at least one file!")
+            return
+        if not search_tag:
+            st.error("Please enter a search tag!")
+            return
+
         try:
-            # Use the chat engine to generate a response based on the tag
-            prompt = f"Find news articles related to the tag: {tag}. Provide the original Gujarati text, English translation, and a brief summary."
-            response = st.session_state.chat_engine.chat(prompt)
-            formatted_response = format_response(response.response)
+            for filename in selected_files:
+                pdf_path = st.session_state.indexed_files[filename]
+                st.markdown(f"### Processing file: {filename}")
+                progress_bar = st.progress(0, f"Starting processing for {filename}...")
 
-            if formatted_response:
-                st.markdown("### Search Results:")
-                st.markdown(formatted_response, unsafe_allow_html=True)
-            else:
-                st.write("No articles found for the given tag.")
+                results = process_pdf(pdf_path, search_tag, progress_bar)
+
+                if results:
+                    st.success(f"Processing complete for {filename}!")
+                    st.markdown("### 🔍 Search Results")
+
+                    sections = results.split('---')
+                    for idx, section in enumerate(sections, 1):
+                        if section.strip():
+                            with st.container():
+                                st.markdown(f"#### News Item {idx}")
+                                st.markdown(section.strip())
+                                st.markdown("---")
+                else:
+                    st.error(f"No relevant news found in {filename}.")
+
         except Exception as e:
-            st.error(f"Error searching for articles: {e}")
+            st.error(f"An error occurred: {str(e)}")
 
-# Chat interface
-if prompt := st.chat_input("Ask a question about GPMC Act or AMC procedures"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    # Help section
+    with st.expander("ℹ️ How to use"):
+        st.markdown("""
+        1. **Select Files**: Choose files from the sidebar
+        2. **Enter Tag**: Type the topic you want to search for
+        3. **Search**: Click 'Search Newspapers' button
+        4. **View Results**: See original text, translation, and summary
 
-# Display chat messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"], unsafe_allow_html=True)
+        **Note**:
+        - Processing may take a few minutes for new searches
+        - Results are cached for faster subsequent searches
+        """)
 
-# Generate new response
-if st.session_state.messages and st.session_state.messages[-1]["role"] != "assistant":
-    with st.chat_message("assistant"):
-        try:
-            # Get the complete response
-            response = st.session_state.chat_engine.chat(prompt)
-            formatted_response = format_response(response.response)
-
-            # Display the complete response
-            st.markdown(formatted_response, unsafe_allow_html=True)
-
-            # Append the response to the message history
-            message = {
-                "role": "assistant",
-                "content": formatted_response
-            }
-            st.session_state.messages.append(message)
-        except Exception as e:
-            st.error(f"Error generating response: {e}")
-
-# Add CSS for better formatting
-st.markdown("""
-<style>
-a {
-  color: #0078ff;
-  text-decoration: none;
-}
-a:hover {
-  text-decoration: underline;
-}
-</style>
-""", unsafe_allow_html=True)
+if __name__ == "__main__":
+    main()
