@@ -8,170 +8,188 @@ import os
 
 # Set up the Streamlit page configuration
 st.set_page_config(
-  page_title="Rag Based Newspaper search for CMO",
-  page_icon="🦙",
-  layout="centered",
-  initial_sidebar_state="auto"
+    page_title="Rag Based Newspaper Search for CMO",
+    page_icon="🦙",
+    layout="centered",
+    initial_sidebar_state="auto"
 )
 
 # Initialize OpenAI API key
 openai.api_key = st.secrets.get("openai_key", None)
 if not openai.api_key:
-  st.error("OpenAI API key is missing. Please add it to the Streamlit secrets.")
-  st.stop()
+    st.error("OpenAI API key is missing. Please add it to the Streamlit secrets.")
+    st.stop()
 
 st.title("NEWS FINDER")
 
 # Initialize session state for messages and references
 if "messages" not in st.session_state:
-  st.session_state.messages = [
-      {
-          "role": "assistant",
-          "content": "Welcome! Please give me the tag you want me to look for in the newspapers"
-      }
-  ]
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": "Welcome! Please give me the tag you want me to look for in the newspapers."
+        }
+    ]
 
 if "references" not in st.session_state:
-  st.session_state.references = []
+    st.session_state.references = []
 
 @st.cache_resource(show_spinner=False)
 def load_data():
-  try:
-      node_parser = SimpleNodeParser.from_defaults(
-          chunk_size=2048,  # Increase chunk size to ensure more content is read
-          chunk_overlap=100,  # Adjust overlap to ensure continuity
-      )
-      
-      reader = SimpleDirectoryReader(
-          input_dir="./data",
-          recursive=True,
-          filename_as_id=True
-      )
-      docs = reader.load_data()
-      
-      system_prompt = """You are a Gujarati newspaper expert. Analyze the image, find all relevant news related to the given tag, 
-                    and provide the following for each news item:
-                    1. The original Gujarati text
-                    2. English translation
-                    3. Brief summary
-                    Format as:
-                    [Original Gujarati Text]
-                    [English Translation]
-                    [Detailed Summary]
-                    ---
+    try:
+        node_parser = SimpleNodeParser.from_defaults(
+            chunk_size=2048,  # Increase chunk size to ensure more content is read
+            chunk_overlap=100,  # Adjust overlap to ensure continuity
+        )
 
-      
-      For every fact or statement, include a reference to the source document and page number in this format:
-      [Source: Document_Name, Page X]
-      
-      Always structure your responses in a clear, organized manner using:
-      - Bullet points for lists
-      - Numbered steps for procedures
-      - Bold text for important points
-      - Separate sections with clear headings"""
+        reader = SimpleDirectoryReader(
+            input_dir="./data",
+            recursive=True,
+            filename_as_id=True
+        )
+        docs = reader.load_data()
 
-      Settings.llm = OpenAI(
-          model="gpt-4",
-          temperature=0.1,
-          system_prompt=system_prompt,
-      )
-      
-      index = VectorStoreIndex.from_documents(
-          docs,
-          node_parser=node_parser,
-          show_progress=True
-      )
-      return index
-  except Exception as e:
-      st.error(f"Error loading data: {e}")
-      st.stop()
+        system_prompt = """You are a Gujarati newspaper expert. Analyze the image, find all relevant news related to the given tag, 
+                        and provide the following for each news item:
+                        1. The original Gujarati text
+                        2. English translation
+                        3. Brief summary
+                        Format as:
+                        [Original Gujarati Text]
+                        [English Translation]
+                        [Detailed Summary]
+                        ---
+
+        For every fact or statement, include a reference to the source document and page number in this format:
+        [Source: Document_Name, Page X]
+
+        Always structure your responses in a clear, organized manner using:
+        - Bullet points for lists
+        - Numbered steps for procedures
+        - Bold text for important points
+        - Separate sections with clear headings"""
+
+        Settings.llm = OpenAI(
+            model="gpt-4",
+            temperature=0.1,
+            system_prompt=system_prompt,
+        )
+
+        index = VectorStoreIndex.from_documents(
+            docs,
+            node_parser=node_parser,
+            show_progress=True
+        )
+        return index
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
+        st.stop()
 
 def extract_references(text):
-  pattern = r'$Source: ([^,]+), Page (\d+)$'
-  matches = re.finditer(pattern, text)
-  references = []
-  
-  for match in matches:
-      doc_name, page = match.groups()
-      link = f'<a href="data/{doc_name}.pdf#page={page}" target="_blank">[Source: {doc_name}, Page {page}]</a>'
-      text = text.replace(match.group(0), link)
-      references.append((doc_name, page))
-  
-  # Update session state with current references
-  st.session_state.references = list(set(references))  # Use set to avoid duplicate entries
-  return text
+    pattern = r'$Source: ([^,]+), Page (\d+)$'
+    matches = re.finditer(pattern, text)
+    references = []
+
+    for match in matches:
+        doc_name, page = match.groups()
+        link = f'<a href="data/{doc_name}.pdf#page={page}" target="_blank">[Source: {doc_name}, Page {page}]</a>'
+        text = text.replace(match.group(0), link)
+        references.append((doc_name, page))
+
+    # Update session state with current references
+    st.session_state.references = list(set(references))  # Use set to avoid duplicate entries
+    return text
 
 def format_response(response):
-  formatted_response = extract_references(response)
-  formatted_response = formatted_response.replace("Step ", "\n### Step ")
-  formatted_response = formatted_response.replace("Note:", "\n> **Note:**")
-  formatted_response = formatted_response.replace("Important:", "\n> **Important:**")
-  return formatted_response
+    formatted_response = extract_references(response)
+    formatted_response = formatted_response.replace("Step ", "\n### Step ")
+    formatted_response = formatted_response.replace("Note:", "\n> **Note:**")
+    formatted_response = formatted_response.replace("Important:", "\n> **Important:**")
+    return formatted_response
 
 def list_reference_documents():
-  try:
-      files = os.listdir('./data')
-      pdf_files = [f for f in files if f.endswith('.pdf')]
-      if pdf_files:
-          for pdf in pdf_files:
-              doc_name = os.path.splitext(pdf)[0]
-              st.markdown(f'- [{doc_name}](./data/{pdf})', unsafe_allow_html=True)
-      else:
-          st.write("No reference documents found.")
-  except Exception as e:
-      st.error(f"Error listing documents: {e}")
+    try:
+        files = os.listdir('./data')
+        pdf_files = [f for f in files if f.endswith('.pdf')]
+        if pdf_files:
+            for pdf in pdf_files:
+                doc_name = os.path.splitext(pdf)[0]
+                st.markdown(f'- [{doc_name}](./data/{pdf})', unsafe_allow_html=True)
+        else:
+            st.write("No reference documents found.")
+    except Exception as e:
+        st.error(f"Error listing documents: {e}")
 
 # Load the index
 index = load_data()
 
 # Initialize chat engine
 if "chat_engine" not in st.session_state:
-  st.session_state.chat_engine = index.as_chat_engine(
-      chat_mode="condense_question",
-      verbose=True
-  )
+    st.session_state.chat_engine = index.as_chat_engine(
+        chat_mode="condense_question",
+        verbose=True
+    )
 
 # Sidebar for reference documents
 with st.sidebar:
-  st.header("📚 Reference Documents")
-  st.write("Available reference documents:")
-  list_reference_documents()
-  
-  st.header("🔗 References Used")
-  if st.session_state.references:
-      for doc_name, page in st.session_state.references:
-          st.markdown(f'- [Source: {doc_name}, Page {page}](./data/{doc_name}.pdf#page={page})', unsafe_allow_html=True)
-  else:
-      st.write("No references used yet.")
+    st.header("📚 Reference Documents")
+    st.write("Available reference documents:")
+    list_reference_documents()
+
+    st.header("🔗 References Used")
+    if st.session_state.references:
+        for doc_name, page in st.session_state.references:
+            st.markdown(f'- [Source: {doc_name}, Page {page}](./data/{doc_name}.pdf#page={page})', unsafe_allow_html=True)
+    else:
+        st.write("No references used yet.")
+
+# User input for tag search
+tag = st.text_input("Enter a tag to search for in the headlines:")
+
+# Search and display results
+if tag:
+    with st.spinner("Searching for news articles..."):
+        try:
+            # Search for the tag in the index
+            search_results = st.session_state.chat_engine.search(tag)
+            if search_results:
+                st.markdown("### Search Results:")
+                for result in search_results:
+                    formatted_response = format_response(result.response)
+                    st.markdown(formatted_response, unsafe_allow_html=True)
+            else:
+                st.write("No articles found for the given tag.")
+        except Exception as e:
+            st.error(f"Error searching for articles: {e}")
 
 # Chat interface
 if prompt := st.chat_input("Ask a question about GPMC Act or AMC procedures"):
-  st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.messages.append({"role": "user", "content": prompt})
 
 # Display chat messages
 for message in st.session_state.messages:
-  with st.chat_message(message["role"]):
-      st.markdown(message["content"], unsafe_allow_html=True)
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"], unsafe_allow_html=True)
 
 # Generate new response
 if st.session_state.messages and st.session_state.messages[-1]["role"] != "assistant":
-  with st.chat_message("assistant"):
-      try:
-          # Get the complete response
-          response = st.session_state.chat_engine.chat(prompt)
-          formatted_response = format_response(response.response)
-          
-          # Display the complete response
-          st.markdown(formatted_response, unsafe_allow_html=True)
-          
-          # Append the response to the message history
-          message = {
-              "role": "assistant",
-              "content": formatted_response
-          }
-          st.session_state.messages.append(message)
-      except Exception as e:
-          st.error(f"Error generating response: {e}")
+    with st.chat_message("assistant"):
+        try:
+            # Get the complete response
+            response = st.session_state.chat_engine.chat(prompt)
+            formatted_response = format_response(response.response)
+
+            # Display the complete response
+            st.markdown(formatted_response, unsafe_allow_html=True)
+
+            # Append the response to the message history
+            message = {
+                "role": "assistant",
+                "content": formatted_response
+            }
+            st.session_state.messages.append(message)
+        except Exception as e:
+            st.error(f"Error generating response: {e}")
 
 # Add CSS for better formatting
 st.markdown("""
