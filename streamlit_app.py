@@ -123,13 +123,6 @@ def list_reference_documents():
 # Load the index
 index = load_data()
 
-# Initialize chat engine
-if "chat_engine" not in st.session_state:
-    st.session_state.chat_engine = index.as_chat_engine(
-        chat_mode="condense_question",
-        verbose=True
-    )
-
 # Sidebar for reference documents
 with st.sidebar:
     st.header("📚 Reference Documents")
@@ -151,7 +144,7 @@ if tag:
     with st.spinner("Searching for news articles..."):
         try:
             # Search for the tag in the index
-            search_results = st.session_state.chat_engine.search(tag)
+            search_results = index.query(tag)  # Use the index to query for the tag
             if search_results:
                 st.markdown("### Search Results:")
                 for result in search_results:
