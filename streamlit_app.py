@@ -143,13 +143,14 @@ tag = st.text_input("Enter a tag to search for in the headlines:")
 if tag:
     with st.spinner("Searching for news articles..."):
         try:
-            # Search for the tag in the index
-            search_results = index.query(tag)  # Use the index to query for the tag
-            if search_results:
+            # Use the chat engine to generate a response based on the tag
+            prompt = f"Find news articles related to the tag: {tag}. Provide the original Gujarati text, English translation, and a brief summary."
+            response = st.session_state.chat_engine.chat(prompt)
+            formatted_response = format_response(response.response)
+
+            if formatted_response:
                 st.markdown("### Search Results:")
-                for result in search_results:
-                    formatted_response = format_response(result.response)
-                    st.markdown(formatted_response, unsafe_allow_html=True)
+                st.markdown(formatted_response, unsafe_allow_html=True)
             else:
                 st.write("No articles found for the given tag.")
         except Exception as e:
