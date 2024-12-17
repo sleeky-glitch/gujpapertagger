@@ -1,152 +1,187 @@
 import streamlit as st
-from llama_index import VectorStoreIndex, SimpleDirectoryReader, ServiceContext
-from llama_index.llms import OpenAI
-from llama_index.embeddings import OpenAIEmbedding
+import openai
+from llama_index.llms.openai import OpenAI
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
+from llama_index.core.node_parser import SimpleNodeParser
+import re
 import os
-from pathlib import Path
-import time
 
-# Set page configuration
+# Set up the Streamlit page configuration
 st.set_page_config(
-    page_title="ગુજરાતી સમાચાર શોધક",
-    page_icon="📰",
-    layout="wide",
+  page_title="Rag Based Newspaper search for CMO",
+  page_icon="🦙",
+  layout="centered",
+  initial_sidebar_state="auto"
 )
 
-# Constants
-DATA_DIR = Path("data")
+# Initialize OpenAI API key
+openai.api_key = st.secrets.get("openai_key", None)
+if not openai.api_key:
+  st.error("OpenAI API key is missing. Please add it to the Streamlit secrets.")
+  st.stop()
 
-# Initialize session state
-if 'index' not in st.session_state:
-    st.session_state.index = None
+st.title("NEWS FINDER")
 
-def initialize_index():
-    """Initialize the vector store index"""
-    try:
-        # Set up OpenAI credentials
-        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+# Initialize session state for messages and references
+if "messages" not in st.session_state:
+  st.session_state.messages = [
+      {
+          "role": "assistant",
+          "content": "Welcome! Please give me the tag you want me to look for in the newspapers"
+      }
+  ]
 
-        # Configure LlamaIndex
-        llm = OpenAI(temperature=0, model="gpt-4")
-        embed_model = OpenAIEmbedding()
-        service_context = ServiceContext.from_defaults(
-            llm=llm,
-            embed_model=embed_model,
-            chunk_size=1024
-        )
+if "references" not in st.session_state:
+  st.session_state.references = []
 
-        # Load documents
-        if not DATA_DIR.exists():
-            os.makedirs(DATA_DIR)
-            st.warning("No documents found in data directory.")
-            return None
+@st.cache_resource(show_spinner=False)
+def load_data():
+  try:
+      node_parser = SimpleNodeParser.from_defaults(
+          chunk_size=2048,  # Increase chunk size to ensure more content is read
+          chunk_overlap=100,  # Adjust overlap to ensure continuity
+      )
+      
+      reader = SimpleDirectoryReader(
+          input_dir="./data",
+          recursive=True,
+          filename_as_id=True
+      )
+      docs = reader.load_data()
+      
+      system_prompt = """You are a Gujarati newspaper expert. Analyze the image, find all relevant news related to the given tag, 
+                    and provide the following for each news item:
+                    1. The original Gujarati text
+                    2. English translation
+                    3. Brief summary
+                    Format as:
+                    [Original Gujarati Text]
+                    [English Translation]
+                    [Detailed Summary]
+                    ---
 
-        documents = SimpleDirectoryReader(
-            input_dir=str(DATA_DIR),
-            filename_as_id=True
-        ).load_data()
+      
+      For every fact or statement, include a reference to the source document and page number in this format:
+      [Source: Document_Name, Page X]
+      
+      Always structure your responses in a clear, organized manner using:
+      - Bullet points for lists
+      - Numbered steps for procedures
+      - Bold text for important points
+      - Separate sections with clear headings"""
 
-        if not documents:
-            st.warning("No documents found in data directory.")
-            return None
+      Settings.llm = OpenAI(
+          model="gpt-4",
+          temperature=0.1,
+          system_prompt=system_prompt,
+      )
+      
+      index = VectorStoreIndex.from_documents(
+          docs,
+          node_parser=node_parser,
+          show_progress=True
+      )
+      return index
+  except Exception as e:
+      st.error(f"Error loading data: {e}")
+      st.stop()
 
-        # Create index
-        index = VectorStoreIndex.from_documents(
-            documents,
-            service_context=service_context,
-            show_progress=True
-        )
+def extract_references(text):
+  pattern = r'$Source: ([^,]+), Page (\d+)$'
+  matches = re.finditer(pattern, text)
+  references = []
+  
+  for match in matches:
+      doc_name, page = match.groups()
+      link = f'<a href="data/{doc_name}.pdf#page={page}" target="_blank">[Source: {doc_name}, Page {page}]</a>'
+      text = text.replace(match.group(0), link)
+      references.append((doc_name, page))
+  
+  # Update session state with current references
+  st.session_state.references = list(set(references))  # Use set to avoid duplicate entries
+  return text
 
-        return index
+def format_response(response):
+  formatted_response = extract_references(response)
+  formatted_response = formatted_response.replace("Step ", "\n### Step ")
+  formatted_response = formatted_response.replace("Note:", "\n> **Note:**")
+  formatted_response = formatted_response.replace("Important:", "\n> **Important:**")
+  return formatted_response
 
-    except Exception as e:
-        st.error(f"Error initializing index: {str(e)}")
-        return None
+def list_reference_documents():
+  try:
+      files = os.listdir('./data')
+      pdf_files = [f for f in files if f.endswith('.pdf')]
+      if pdf_files:
+          for pdf in pdf_files:
+              doc_name = os.path.splitext(pdf)[0]
+              st.markdown(f'- [{doc_name}](./data/{pdf})', unsafe_allow_html=True)
+      else:
+          st.write("No reference documents found.")
+  except Exception as e:
+      st.error(f"Error listing documents: {e}")
 
-def query_index(index, query, num_results=5):
-    """Query the vector store index"""
-    try:
-        query_engine = index.as_query_engine(
-            similarity_top_k=num_results,
-            response_mode="tree_summarize"
-        )
-        response = query_engine.query(
-            f"""Find relevant news about {query}. 
-            For each relevant piece, provide:
-            1. The original Gujarati text
-            2. English translation
-            3. Brief summary
-            Format as:
-            [Original Gujarati Text]
-            [English Translation]
-            [Brief Summary]
-            ---"""
-        )
-        return response
+# Load the index
+index = load_data()
 
-    except Exception as e:
-        st.error(f"Error querying index: {str(e)}")
-        return None
+# Initialize chat engine
+if "chat_engine" not in st.session_state:
+  st.session_state.chat_engine = index.as_chat_engine(
+      chat_mode="condense_question",
+      verbose=True
+  )
 
-def main():
-    st.title("ગુજરાતી સમાચાર શોધક (Gujarati News Finder)")
-    st.write("Search through indexed Gujarati newspapers")
+# Sidebar for reference documents
+with st.sidebar:
+  st.header("📚 Reference Documents")
+  st.write("Available reference documents:")
+  list_reference_documents()
+  
+  st.header("🔗 References Used")
+  if st.session_state.references:
+      for doc_name, page in st.session_state.references:
+          st.markdown(f'- [Source: {doc_name}, Page {page}](./data/{doc_name}.pdf#page={page})', unsafe_allow_html=True)
+  else:
+      st.write("No references used yet.")
 
-    # Initialize index at startup
-    if st.session_state.index is None:
-        with st.spinner("Initializing document index..."):
-            st.session_state.index = initialize_index()
+# Chat interface
+if prompt := st.chat_input("Ask a question about GPMC Act or AMC procedures"):
+  st.session_state.messages.append({"role": "user", "content": prompt})
 
-    if st.session_state.index is None:
-        st.error("Failed to initialize document index.")
-        return
+# Display chat messages
+for message in st.session_state.messages:
+  with st.chat_message(message["role"]):
+      st.markdown(message["content"], unsafe_allow_html=True)
 
-    # Search interface
-    search_tag = st.text_input(
-        "Enter search tag",
-        placeholder="Enter topic in English or Gujarati",
-        help="Enter the topic you want to search for in the newspapers"
-    )
+# Generate new response
+if st.session_state.messages and st.session_state.messages[-1]["role"] != "assistant":
+  with st.chat_message("assistant"):
+      try:
+          # Get the complete response
+          response = st.session_state.chat_engine.chat(prompt)
+          formatted_response = format_response(response.response)
+          
+          # Display the complete response
+          st.markdown(formatted_response, unsafe_allow_html=True)
+          
+          # Append the response to the message history
+          message = {
+              "role": "assistant",
+              "content": formatted_response
+          }
+          st.session_state.messages.append(message)
+      except Exception as e:
+          st.error(f"Error generating response: {e}")
 
-    num_results = st.slider(
-        "Number of results",
-        min_value=1,
-        max_value=10,
-        value=5
-    )
-
-    # Process button
-    if st.button("Search Newspapers 📰", key="search_btn"):
-        if not search_tag:
-            st.error("Please enter a search tag!")
-            return
-
-        try:
-            with st.spinner("Searching newspapers..."):
-                results = query_index(st.session_state.index, search_tag, num_results)
-
-            if results:
-                st.success("Search complete!")
-                st.markdown("### 🔍 Search Results")
-                st.markdown(str(results))
-            else:
-                st.warning("No relevant news found.")
-
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-
-    # Help section
-    with st.expander("ℹ️ How to use"):
-        st.markdown("""
-        1. **Enter Tag**: Type the topic you want to search for
-        2. **Adjust Results**: Select how many results you want to see
-        3. **Search**: Click 'Search Newspapers' button
-        4. **View Results**: See original text, translation, and summary
-
-        **Note**:
-        - The search uses AI to find and translate relevant content
-        - Results include both Gujarati text and English translations
-        """)
-
-if __name__ == "__main__":
-    main()
+# Add CSS for better formatting
+st.markdown("""
+<style>
+a {
+  color: #0078ff;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+</style>
+""", unsafe_allow_html=True)
